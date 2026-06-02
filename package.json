@@ -1,0 +1,19 @@
+{
+  "name": "ancx-docs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "技术文档博客 - 记录前端、后端与运维的学习与实践",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "vitepress": "^1.6.4"
+  },
+  "dependencies": {
+    "vue": "^3.5.34"
+  }
+}
