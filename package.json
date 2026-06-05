@@ -5,7 +5,7 @@
   "type": "module",
   "description": "技术文档博客 - 记录前端、后端与运维的学习与实践",
   "scripts": {
-    "dev": "vitepress dev",
+    "dev": "vitepress dev --open",
     "build": "vitepress build",
     "preview": "vitepress preview"
   },
