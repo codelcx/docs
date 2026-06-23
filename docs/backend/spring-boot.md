@@ -3,7 +3,7 @@ title: Spring Boot 从入门到实践
 date: 2026-05-15
 category: backend
 sort: 999
-description: Spring Boot 配置、多线程与多环境管理详解
+description: Spring Boot 配置、多线程、多环境管理与事务管理详解
 ---
 
 # Spring Boot 从入门到实践
@@ -1251,3 +1251,412 @@ public static <T> Result<T> error(ResultCode code) {
 // 抛出时指定枚举
 throw new BusinessException(ResultCode.NOT_FOUND.getCode(), "用户不存在");
 ```
+
+## 六、事务管理
+
+**事务（Transaction）** 是一组操作的执行单元，要么全部成功（提交），要么全部失败（回滚）。Spring 通过 `@Transactional` 注解声明式管理事务，底层基于 **AOP 代理** 拦截方法，在方法执行前后自动控制连接的提交或回滚。
+
+> **核心机制**：Spring 使用 `TransactionInterceptor` 环绕增强目标方法。方法执行前获取数据库连接并关闭自动提交；方法成功则 `commit()`，抛出异常则 `rollback()`。这一切对业务代码透明。
+
+### 6.1 What — 什么是事务
+
+| 特性 | 说明 |
+|------|------|
+| **原子性（Atomicity）** | 事务内的操作要么全做，要么全不做 |
+| **一致性（Consistency）** | 事务前后数据满足所有约束 |
+| **隔离性（Isolation）** | 并发事务之间互不干扰 |
+| **持久性（Durability）** | 提交后数据永久保存 |
+
+**Spring 的事务抽象**：
+
+| 角色 | 说明 |
+|------|------|
+| `PlatformTransactionManager` | 事务管理器顶层接口 |
+| `DataSourceTransactionManager` | JDBC / MyBatis 事务管理器 |
+| `JpaTransactionManager` | JPA / Hibernate 事务管理器 |
+| `@Transactional` | 声明式事务注解（生产最常用） |
+
+### 6.2 When — 何时使用事务
+
+**必须使用事务的场景**：
+- 同时操作多张表（如：下单 = 插入订单表 + 扣减库存 + 更新用户积分）
+- **CUD 组合操作**（Create + Update + Delete）需要保证数据一致性
+- 调用外部接口前先保存本地记录，外部调用失败需回滚
+
+**不需要 / 不应使用事务的场景**：
+- 纯查询（SELECT 不需要事务，除非需要特定隔离级别或锁）
+- 单条简单 INSERT / UPDATE 操作（数据库单条语句隐式事务足以）
+- 批量导入大量数据（事务会持有连接和锁，降低吞吐量，可考虑分批事务）
+
+### 6.3 How — 如何使用事务
+
+#### 6.3.1 基础使用
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private OrderMapper orderMapper;
+    @Autowired
+    private StockMapper stockMapper;
+    @Autowired
+    private UserMapper userMapper;
+
+    @Transactional                                 // 方法内所有操作共享一个数据库连接
+    public void createOrder(Order order) {
+        orderMapper.insert(order);                 // 插入订单
+        stockMapper.reduceStock(order.getSkuId()); // 扣减库存
+        userMapper.addScore(order.getUserId(), 1); // 增加积分
+        // 任一操作抛出 RuntimeException → 全部回滚
+    }
+}
+```
+
+#### 6.3.2 回滚规则
+
+默认只对 `RuntimeException` 和 `Error` 回滚，**受检异常（Exception 子类，不含 RuntimeException）不回滚**。可通过参数自定义：
+
+```java
+@Transactional(
+    rollbackFor = Exception.class,                // 所有异常都回滚
+    noRollbackFor = {BusinessException.class}     // 业务异常不回滚
+)
+public void createOrder(Order order) {
+    // ...
+}
+```
+
+**最佳实践**：总是显式指定 `rollbackFor = Exception.class`，避免受检异常意外不回滚。
+
+#### 6.3.3 传播行为（Propagation）
+
+控制事务边界——当 `@Transactional` 方法调用另一个 `@Transactional` 方法时如何处理：
+
+| 传播属性 | 行为 |
+|---------|------|
+| `REQUIRED`（默认） | 支持当前事务，不存在则新建 |
+| `REQUIRES_NEW` | 挂起当前事务，新建一个独立事务 |
+| `NESTED` | 当前事务内嵌套一个子事务（Savepoint） |
+| `SUPPORTS` | 支持当前事务，不存在则以非事务方式执行 |
+| `NOT_SUPPORTED` | 以非事务方式执行，挂起当前事务 |
+| `MANDATORY` | 必须存在当前事务，否则抛异常 |
+| `NEVER` | 必须不在事务中，否则抛异常 |
+
+```java
+@Service
+public class LogService {
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)  // 独立事务，不受外部回滚影响
+    public void saveLog(Log log) {
+        logMapper.insert(log);
+    }
+}
+
+@Service
+public class OrderService {
+
+    @Autowired
+    private LogService logService;
+
+    @Transactional
+    public void createOrder(Order order) {
+        orderMapper.insert(order);
+        logService.saveLog(new Log("创建订单"));  // 即使外部回滚，日志依然写入
+    }
+}
+```
+
+**`REQUIRES_NEW` 与 `NESTED` 区别**：
+
+| 特性 | `REQUIRES_NEW` | `NESTED` |
+|------|---------------|----------|
+| 内层回滚 | 不影响外层 | 可仅回滚到 Savepoint |
+| 外层回滚 | 不影响内层（已提交） | 内层也会回滚 |
+| 底层实现 | 独立数据库连接 | Savepoint（同一连接） |
+| 性能 | 较高（额外连接） | 较低 |
+
+#### 6.3.4 隔离级别（Isolation）
+
+解决并发事务产生的**脏读、不可重复读、幻读**问题：
+
+```java
+@Transactional(isolation = Isolation.READ_COMMITTED)
+public void queryAndUpdate() { ... }
+```
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 | 说明 |
+|---------|:----:|:--------:|:----:|------|
+| `DEFAULT` | — | — | — | 使用数据库默认级别（MySQL = REPEATABLE_READ） |
+| `READ_UNCOMMITTED` | ✅ | ✅ | ✅ | 可能读到未提交数据，几乎不用 |
+| `READ_COMMITTED` | ❌ | ✅ | ✅ | 大多数数据库默认，避免脏读 |
+| `REPEATABLE_READ` | ❌ | ❌ | ✅ | InnoDB 默认，通过 MVCC 避免不可重复读 |
+| `SERIALIZABLE` | ❌ | ❌ | ❌ | 完全串行化，性能最低 |
+
+> **MySQL InnoDB 默认 REPEATABLE_READ**，通过 MVCC + Gap Lock 可避免幻读。生产环境最常见的是 `READ_COMMITTED`（Oracle/PostgreSQL 默认）或保持 `DEFAULT`。
+
+#### 6.3.5 超时与只读
+
+```java
+@Transactional(
+    timeout = 5,          // 超时秒数（默认 -1 不限制）
+    readOnly = true       // 只读优化（底层走只读连接，部分数据库可跳过锁）
+)
+public List<Order> findOrders() {
+    return orderMapper.selectList();
+}
+```
+
+> `readOnly = true` 仅对**纯查询方法**有意义，CUD 操作标记 `readOnly` 会导致写入失败。它会通知 `EntityManager` 或 JDBC 驱动进行性能优化（如 MySQL 跳过脏读检查）。
+
+### 6.4 事务失效场景及解决方案
+
+#### 6.4.1 同类方法自调用（最常踩坑）
+
+```java
+@Service
+public class OrderService {
+
+    public void createOrder(Order order) {         // 没有 @Transactional
+        this.saveOrder(order);                     // ❌ 自调用，事务注解失效
+    }
+
+    @Transactional
+    public void saveOrder(Order order) {           // 事务不生效
+        orderMapper.insert(order);
+    }
+}
+```
+
+**原因**：`@Transactional` 基于 AOP 代理。自调用通过 `this` 直接调用目标方法，**不走代理对象**，因此拦截器不生效。
+
+**解决方案**：
+
+```java
+// 方案一：注入自身代理（推荐，配合 @EnableAspectJAutoProxy）
+@EnableAspectJAutoProxy(exposeProxy = true)        // 在启动类或配置类上添加
+
+@Service
+public class OrderService {
+
+    public void createOrder(Order order) {
+        ((OrderService) AopContext.currentProxy()).saveOrder(order);  // 走代理
+    }
+
+    @Transactional
+    public void saveOrder(Order order) {
+        orderMapper.insert(order);
+    }
+}
+
+// 方案二：拆分到不同 Service
+@Service
+public class OrderFacade {
+
+    @Autowired
+    private OrderService orderService;
+
+    @Transactional
+    public void createOrder(Order order) {
+        orderService.saveOrder(order);             // 跨类调用 → 走代理 ✅
+    }
+}
+
+@Service
+public class OrderService {
+
+    public void saveOrder(Order order) {
+        orderMapper.insert(order);
+    }
+}
+```
+
+#### 6.4.2 异常被 catch 吃掉
+
+```java
+@Transactional
+public void createOrder(Order order) {
+    try {
+        orderMapper.insert(order);
+        stockMapper.reduceStock(order.getSkuId());
+    } catch (Exception e) {
+        log.error("操作失败", e);
+        // ❌ 没有抛出异常 → 事务认为执行成功，不会回滚
+    }
+}
+```
+
+**解决方案**：catch 后继续抛出异常（或调用 `TransactionAspectSupport` 手动回滚）。
+
+```java
+@Transactional
+public void createOrder(Order order) {
+    try {
+        orderMapper.insert(order);
+        stockMapper.reduceStock(order.getSkuId());
+    } catch (Exception e) {
+        log.error("操作失败", e);
+        throw e;                                   // ✅ 重新抛出，让拦截器触发回滚
+    }
+}
+
+// 如果不想抛出给上层，可手动回滚：
+@Transactional
+public void createOrder(Order order) {
+    try {
+        orderMapper.insert(order);
+        stockMapper.reduceStock(order.getSkuId());
+    } catch (Exception e) {
+        log.error("操作失败", e);
+        TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();  // ✅ 标记回滚
+    }
+}
+```
+
+#### 6.4.3 方法非 public
+
+```java
+@Service
+public class OrderService {
+
+    @Transactional
+    protected void saveOrder(Order order) {        // ❌ protected 方法，事务不生效
+        orderMapper.insert(order);
+    }
+}
+```
+
+**原因**：Spring AOP 默认只增强 `public` 方法。非 `public` 方法不会被代理拦截（除非使用 AspectJ 织入）。
+
+**解决方案**：使用 `public` 修饰。
+
+#### 6.4.4 @Transactional 加在接口上
+
+```java
+public interface OrderService {
+    @Transactional                                 // ❌ 接口注解可能不生效
+    void createOrder(Order order);
+}
+```
+
+**原因**：使用 JDK 动态代理时，接口方法上的 `@Transactional` 可被识别；使用 CGLIB 时，接口注解会被忽略。Spring Boot 2.x+ 默认开启 CGLIB 代理（`spring.aop.proxy-target-class=true`），因此接口注解失效。
+
+**解决方案**：加在实现类的方法上。
+
+#### 6.4.5 使用 new 关键字创建对象
+
+```java
+@Service
+public class OrderService {
+
+    public void createOrder(Order order) {
+        new OtherService().saveOrder(order);       // ❌ new 出来的对象不受 Spring 管理
+    }
+}
+
+public class OtherService {
+
+    @Transactional
+    public void saveOrder(Order order) {           // 事务不生效
+        orderMapper.insert(order);
+    }
+}
+```
+
+**解决方案**：确保目标类也被 Spring 管理（标记 `@Service`、`@Component` 等），并通过依赖注入获取实例。
+
+#### 6.4.6 多线程中事务失效
+
+```java
+@Transactional
+public void processBatch(List<Order> orders) {
+    orders.forEach(order -> {
+        new Thread(() -> {
+            orderMapper.insert(order);             // ❌ 新线程中的操作不在原事务内
+        }).start();
+    });
+}
+```
+
+**原因**：事务绑定到当前线程的 `ThreadLocal`（数据库连接），新线程拿不到原事务的连接，也就无法回滚。
+
+**解决方案**：
+
+```java
+// 方式一：在循环外执行批量操作
+@Transactional
+public void processBatch(List<Order> orders) {
+    orders.forEach(order -> orderMapper.insert(order));  // ✅ 同一线程，同一事务
+}
+
+// 方式二：每个线程内独立事务
+public void processBatch(List<Order> orders) {
+    orders.forEach(order ->
+        CompletableFuture.runAsync(() -> singleInsert(order))  // 异步执行
+    );
+}
+
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void singleInsert(Order order) {
+    orderMapper.insert(order);
+}
+```
+
+#### 6.4.7 数据库引擎不支持事务
+
+```java
+// application.yml
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/test
+    driver-class-name: com.mysql.cj.jdbc.Driver
+```
+
+如果某张表使用了 `MyISAM` 引擎（MySQL 5.7 之前默认），则 `@Transactional` 不会报错，但**永远不会回滚**。
+
+**解决方案**：确保表引擎为 InnoDB。
+
+```sql
+-- 检查表引擎
+SHOW TABLE STATUS WHERE Name = 'orders';
+
+-- 修改为 InnoDB
+ALTER TABLE orders ENGINE = InnoDB;
+```
+
+#### 6.4.8 事务未被 Spring 管理
+
+```java
+// 如果配置中排除了事务管理器：
+@SpringBootApplication(exclude = DataSourceTransactionManagerAutoConfiguration.class)
+// ❌ 事务管理器未启用，@Transactional 全部失效
+```
+
+**解决方案**：确保 `DataSourceTransactionManager` Bean 存在。Spring Boot 自动配置默认已注入，除非手动排除。
+
+#### 6.4.9 @Transactional 与 @Async 混用
+
+```java
+@Transactional
+@Async                                              // ❌ @Async 会修改目标类的代理
+public void asyncSave(Order order) {
+    orderMapper.insert(order);
+}
+```
+
+**原因**：多个 AOP 注解同时作用时，如果顺序不对，`@Async` 的代理可能先于事务代理执行，导致事务不生效。
+
+**解决方案**：分离事务方法与异步方法，或在方法内部显式调用事务方法走代理。
+
+### 6.5 常见问题总结
+
+| 场景 | 原因 | 解决方案 |
+|------|------|---------|
+| 自调用 | 不走代理 | 使用 `AopContext.currentProxy()` 或拆分 Service |
+| 异常被 catch | 未抛出回滚信号 | 重新抛出或 `setRollbackOnly()` |
+| 非 public 方法 | AOP 不增强非 public | 改为 `public` |
+| 接口上注解 | CGLIB 忽略接口注解 | 加在实现类上 |
+| new 对象 | 非 Spring 管理 | 用 `@Autowired` 注入 |
+| 多线程 | 事务绑定线程 | 单线程或每线程独立事务 |
+| MyISAM | 不支持事务 | 改为 InnoDB |
+| 事务管理器未配置 | 自动配置被排除 | 确认 `DataSourceTransactionManager` 存在 |
